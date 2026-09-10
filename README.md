@@ -1,5 +1,12 @@
 # httptry
 
+[![Go Documentation](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)][godocs]
+
+[godocs]: https://pkg.go.dev/github.com/nodivbyzero/httptry
+
+Full API docs: [pkg.go.dev/github.com/nodivbyzero/httptry](https://pkg.go.dev/github.com/nodivbyzero/httptry/)
+
+
 Retry-aware HTTP requests built on top of the generic
 [`github.com/nodivbyzero/try`](https://github.com/nodivbyzero/try) retry engine.
 
