@@ -318,3 +318,7 @@ Context cancellation and deadline expiry are treated as normal control flow.
 `httptry` does not emit built-in error logs for cancellation; applications can
 classify these outcomes through `DoWithStats`, `WithOnAttempt`, or their own
 request hooks.
+
+## License
+
+MIT
