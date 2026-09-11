@@ -20,9 +20,11 @@ import (
 // or response-processing error, if any.
 type RetryPolicy func(resp *http.Response, err error) bool
 
-// AttemptInfo describes a failed attempt for observability hooks.
+// AttemptInfo describes a failed attempt for observability hooks. Duration is
+// the time spent executing that attempt, excluding the subsequent backoff.
 type AttemptInfo struct {
 	Attempt  int
+	Duration time.Duration
 	Response *http.Response
 	Err      error
 	Delay    time.Duration
@@ -94,7 +96,10 @@ type RequestLogHook func(logger Logger, req *http.Request, attempt int)
 type ResponseLogHook func(logger Logger, resp *http.Response)
 
 // Client performs HTTP requests with retry support. A Client is safe for
-// concurrent use after construction.
+// concurrent use after construction. Configure it with NewClient options and
+// do not mutate its exported fields after the first request; concurrent field
+// mutation is not safe. The OnAttempt field is retained for compatibility;
+// WithOnAttempt is preferred for construction-time configuration.
 type Client struct {
 	HTTPClient         *http.Client
 	Options            []try.Option
@@ -196,6 +201,13 @@ func WithTryOptions(opts ...try.Option) Option {
 	return func(c *Client) { c.Options = append(c.Options, opts...) }
 }
 
+// WithAttemptTimeout limits the duration of each individual HTTP attempt.
+// This is distinct from WithMaxElapsedTime, which limits the complete
+// operation including backoff and all attempts.
+func WithAttemptTimeout(d time.Duration) Option {
+	return WithTryOptions(try.WithTimeout(d))
+}
+
 // WithAttempts sets the maximum number of attempts, including the first.
 func WithAttempts(n int) Option { return WithTryOptions(try.WithAttempts(n)) }
 
@@ -287,6 +299,7 @@ func WithErrorHandler(fn ErrorHandler) Option {
 }
 
 // WithStatsErrorHandler sets an error callback that also receives RetryStats.
+// ErrorHandler takes precedence when both handlers are configured.
 func WithStatsErrorHandler(fn StatsErrorHandler) Option {
 	return func(c *Client) { c.StatsErrorHandler = fn }
 }
@@ -340,7 +353,9 @@ func DefaultRetryPolicy(resp *http.Response, err error) bool {
 // Do executes req, retrying according to the Client configuration. A response
 // is returned for successful or non-retryable HTTP results. When retries are
 // exhausted, the final retryable response body is drained and closed and the
-// response is not returned.
+// response is not returned. Unsafe methods such as POST and PATCH take a
+// single-attempt fast path unless WithUnsafeMethods is configured; retry-only
+// hooks and timing options do not run on that path.
 func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
 	resp, _, err := c.DoWithStats(ctx, req)
 	return resp, err
@@ -438,42 +453,30 @@ func (c *Client) DoWithStats(ctx context.Context, req *http.Request) (*http.Resp
 		}
 		return policy(ae.response, ae.err)
 	}))
-	if c.OnRetry != nil {
-		options = append(options, try.WithOnRetry(func(info try.RetryInfo) {
-			if deadline, ok := operationCtx.Deadline(); ok && info.Delay > time.Until(deadline) {
-				deadlineExceededDuringBackoff = true
-				cancel()
-			}
-			var ae *attemptError
-			if errors.As(info.Err, &ae) {
-				stats.BackoffDuration += info.Delay
-				stats.Reasons = append(stats.Reasons, RetryReason{
-					Attempt:    info.Attempt,
-					StatusCode: statusCode(ae.response),
-					Err:        ae.err,
-					Delay:      info.Delay,
-				})
-				c.OnRetry(AttemptInfo{Attempt: info.Attempt, Response: ae.response, Err: ae.err, Delay: info.Delay})
-			}
-		}))
-	} else {
-		options = append(options, try.WithOnRetry(func(info try.RetryInfo) {
-			if deadline, ok := operationCtx.Deadline(); ok && info.Delay > time.Until(deadline) {
-				deadlineExceededDuringBackoff = true
-				cancel()
-			}
-			var ae *attemptError
-			if errors.As(info.Err, &ae) {
-				stats.BackoffDuration += info.Delay
-				stats.Reasons = append(stats.Reasons, RetryReason{
-					Attempt:    info.Attempt,
-					StatusCode: statusCode(ae.response),
-					Err:        ae.err,
-					Delay:      info.Delay,
-				})
-			}
-		}))
-	}
+	options = append(options, try.WithOnRetry(func(info try.RetryInfo) {
+		if deadline, ok := operationCtx.Deadline(); ok && info.Delay > time.Until(deadline) {
+			deadlineExceededDuringBackoff = true
+			cancel()
+		}
+		var ae *attemptError
+		if !errors.As(info.Err, &ae) {
+			return
+		}
+		stats.BackoffDuration += info.Delay
+		stats.Reasons = append(stats.Reasons, RetryReason{
+			Attempt:    info.Attempt,
+			StatusCode: statusCode(ae.response),
+			Err:        ae.err,
+			Delay:      info.Delay,
+		})
+		attemptDuration := time.Duration(0)
+		if n := len(stats.AttemptsDetail); n > 0 {
+			attemptDuration = stats.AttemptsDetail[n-1].Duration
+		}
+		if c.OnRetry != nil {
+			c.OnRetry(AttemptInfo{Attempt: info.Attempt, Duration: attemptDuration, Response: ae.response, Err: ae.err, Delay: info.Delay})
+		}
+	}))
 
 	var lastResponse *http.Response
 	var previousResponse *http.Response
@@ -572,6 +575,11 @@ func (c *Client) DoWithStats(ctx context.Context, req *http.Request) (*http.Resp
 	if deadlineExceededDuringBackoff {
 		err = context.DeadlineExceeded
 	}
+	if ctx.Err() == nil && operationCtx.Err() == nil {
+		if retryErr := newRetryError(err, stats.Attempts); retryErr != nil {
+			err = retryErr
+		}
+	}
 	if c.ErrorHandler != nil {
 		response, handledErr := c.ErrorHandler(lastResponse, err, stats.Attempts)
 		return finish(response, handledErr)
@@ -653,6 +661,7 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, original *http.Req
 			return nil, err
 		}
 		req.Body = body
+		req.GetBody = bodyFactory
 	}
 	return hc.Do(req)
 }
@@ -693,6 +702,35 @@ type attemptError struct {
 	shouldRetry      bool
 }
 
+// RetryError describes an operation that exhausted its configured attempts.
+// StatusCode is zero when the final failure was a transport error. Err is the
+// underlying transport or response-processing error when one exists.
+type RetryError struct {
+	Attempts   int
+	StatusCode int
+	Err        error
+}
+
+func (e *RetryError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("httptry: exhausted after %d attempt(s): retryable HTTP status %d", e.Attempts, e.StatusCode)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("httptry: exhausted after %d attempt(s): %v", e.Attempts, e.Err)
+	}
+	return fmt.Sprintf("httptry: exhausted after %d attempt(s)", e.Attempts)
+}
+
+func (e *RetryError) Unwrap() error { return e.Err }
+
+func newRetryError(err error, attempts int) *RetryError {
+	var ae *attemptError
+	if !errors.As(err, &ae) {
+		return nil
+	}
+	return &RetryError{Attempts: attempts, StatusCode: statusCode(ae.response), Err: ae.err}
+}
+
 type realClock struct{}
 
 func (realClock) Now() time.Time                             { return time.Now() }
@@ -730,7 +768,14 @@ type retryAfterAttemptError struct {
 
 func (e *retryAfterAttemptError) RetryAfter() time.Duration { return e.delay }
 
+// Unwrap exposes the underlying attemptError while retaining the
+// RetryAfterer method used by the retry engine.
+func (e *retryAfterAttemptError) Unwrap() error { return e.attemptError }
+
 func newResponseError(resp *http.Response) error {
+	// retryAfterAttemptError implements try.RetryAfterer. The try engine honors
+	// that interface before its normal delay calculation; keep this coupling
+	// explicit so Retry-After behavior is preserved across engine refactors.
 	e := &attemptError{response: resp}
 	if resp != nil {
 		if delay := retryAfter(resp.Header.Get("Retry-After"), time.Now()); delay > 0 {
@@ -766,7 +811,7 @@ func drainAndClose(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 }
 

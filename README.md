@@ -143,6 +143,10 @@ When a request has no `GetBody` function, `httptry` buffers its body before the
 first attempt so it can replay it. Avoid this for very large or inherently
 streaming bodies unless you provide an appropriate body factory.
 
+The convenience `Post` and `PostContext` methods accept `io.Reader` values and
+use the same buffering behavior. Use `NewRequest` with a `BodyFactory` for
+large, streaming, or explicitly replayable request bodies.
+
 `httptry` retries failures while sending the request or receiving response
 headers. It returns the response body to the caller, so failures that occur
 later while the caller reads `resp.Body` are not automatically retried.
@@ -166,6 +170,16 @@ client := httptry.NewClient(
 
 `WithRetryMax` counts retries after the initial request. For example,
 `WithRetryMax(3)` allows up to four total attempts.
+
+Use `WithAttemptTimeout` to bound each individual attempt separately from the
+overall `WithMaxElapsedTime` budget:
+
+```go
+client := httptry.NewClient(
+	httptry.WithAttemptTimeout(2 * time.Second),
+	httptry.WithMaxElapsedTime(15 * time.Second),
+)
+```
 
 If both `WithRetryIf` and compatibility-style `WithCheckRetry` are configured,
 `CheckRetry` takes precedence for each attempt. Its boolean result replaces the
@@ -197,6 +211,21 @@ client := httptry.NewClient(
 )
 ```
 
+Use `WithOnRetry` when you need the selected delay and the failed attempt's
+duration in one callback:
+
+```go
+client := httptry.NewClient(
+	httptry.WithOnRetry(func(info httptry.AttemptInfo) {
+		log.Printf("attempt=%d duration=%s delay=%s", info.Attempt, info.Duration, info.Delay)
+	}),
+)
+```
+
+When retries are exhausted, `Do` and `DoWithStats` return
+`*httptry.RetryError`. It exposes `Attempts`, `StatusCode`, and the underlying
+transport error through `Unwrap`, so `errors.Is` and `errors.As` remain useful.
+
 ## Preparing retries
 
 Use `WithPrepareRetry` to refresh credentials or modify a request after a
@@ -217,6 +246,10 @@ The hook receives the previous response and error before the next attempt.
 For a retryable HTTP status, the error is a retryable status error; for a
 transport or response-header failure, it is the underlying failure. The
 previous response has already been drained and closed before this hook runs.
+
+Do not reuse the same `*http.Request` concurrently across `Do` calls. Retry
+preparation hooks may mutate the original request while preparing the next
+attempt.
 
 ## Hooks and error handling
 

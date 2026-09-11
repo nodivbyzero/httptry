@@ -139,6 +139,9 @@ application-level guarantee before enabling them.
 `WithStatsErrorHandler` is an `httptry` addition that supplies complete
 `RetryStats` to the final error handler.
 
+`WithAttemptTimeout` provides a first-class per-attempt deadline, distinct from
+the overall `WithMaxElapsedTime` budget.
+
 When both `WithRetryIf` and `WithCheckRetry` are configured, the compatibility
 callback wins for each attempt. Its boolean result replaces the `RetryIf`
 decision, and a non-nil error stops the operation. This makes it possible to
@@ -152,7 +155,9 @@ previous response has already been drained and closed before the hook runs.
 
 Final errors preserve the underlying transport error through Go's standard
 `Unwrap` chain. Existing `errors.Is` and `errors.As` checks for network or
-other transport errors can continue to work after migration.
+other transport errors can continue to work after migration. Exhausted
+operations return `*httptry.RetryError`, which also exposes `Attempts` and
+`StatusCode`.
 
 ## Behavior differences
 
@@ -166,6 +171,7 @@ other transport errors can continue to work after migration.
 | Retry preparation | No native credential-refresh hook | `WithPrepareRetry` receives previous response and error |
 | Retry policy precedence | `CheckRetry` policy | `WithCheckRetry` takes precedence over `WithRetryIf` |
 | Error inspection | Underlying error depends on handler | `errors.Is`/`errors.As` can unwrap transport errors |
+| Per-attempt telemetry | Custom hook bookkeeping | `AttemptInfo.Duration` is included with `OnRetry` |
 | Generic retry engine | HTTP-specific | Shared with non-HTTP operations through `try` |
 | Response-body read errors | Caller-managed | Caller-managed; not retried after `Do` returns |
 

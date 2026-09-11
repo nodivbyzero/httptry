@@ -764,6 +764,36 @@ func TestNewRequestBodyFactoryReplaysBody(t *testing.T) {
 	}
 }
 
+func TestRedirectReplaysUnsafeRequestBody(t *testing.T) {
+	var finalBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "/final")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		finalBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	req, err := NewRequest(context.Background(), http.MethodPost, server.URL+"/start", BodyFactory(func() (io.Reader, error) {
+		return strings.NewReader("redirect-body"), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := NewClient(WithAttempts(1), WithUnsafeMethods()).Do(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if finalBody != "redirect-body" {
+		t.Fatalf("redirect body = %q, want redirect-body", finalBody)
+	}
+}
+
 func TestRetryAfterIsCappedByMaxDelay(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "3600")
@@ -783,6 +813,39 @@ func TestRetryAfterIsCappedByMaxDelay(t *testing.T) {
 	}
 	if info.Delay > time.Millisecond {
 		t.Fatalf("retry delay = %s, exceeds max delay", info.Delay)
+	}
+}
+
+func TestRetryAfterIsUsedByEngine(t *testing.T) {
+	transport := &failureInjectionTransport{attempts: []injectedAttempt{
+		{response: func() *http.Response {
+			resp := injectedResponse(http.StatusTooManyRequests, "")
+			resp.Header.Set("Retry-After", "2")
+			return resp
+		}()},
+		{response: injectedResponse(http.StatusOK, "ok")},
+	}}
+	clock := &deterministicClock{now: time.Now()}
+	var observed AttemptInfo
+	client := NewClient(
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithAttempts(2),
+		WithClock(clock),
+		WithOnRetry(func(info AttemptInfo) { observed = info }),
+	)
+	resp, err := client.Get("http://injected.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if observed.Delay != 2*time.Second {
+		t.Fatalf("observed retry delay = %s, want 2s", observed.Delay)
+	}
+	if len(clock.delays) != 1 || clock.delays[0] != 2*time.Second {
+		t.Fatalf("clock delays = %v", clock.delays)
+	}
+	if observed.Duration <= 0 {
+		t.Fatalf("attempt duration = %s, want positive duration", observed.Duration)
 	}
 }
 
@@ -823,6 +886,68 @@ func TestDoWithStats(t *testing.T) {
 	}
 	if stats.LastStatusCode != http.StatusOK {
 		t.Fatalf("last status = %d", stats.LastStatusCode)
+	}
+}
+
+func TestRetryErrorExposesExhaustedStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	resp, err := NewClient(WithAttempts(2), WithDelayFunc(func(int, error) time.Duration { return 0 })).Get(server.URL)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	var retryErr *RetryError
+	if !errors.As(err, &retryErr) {
+		t.Fatalf("error type = %T %v, want *RetryError", err, err)
+	}
+	if retryErr.Attempts != 2 || retryErr.StatusCode != http.StatusBadGateway || retryErr.Err != nil {
+		t.Fatalf("retry error = %+v", retryErr)
+	}
+	if newRetryError(errors.New("not an attempt error"), 1) != nil {
+		t.Fatal("non-attempt error should not become RetryError")
+	}
+}
+
+func TestRetryErrorExposesUnderlyingTransportError(t *testing.T) {
+	transportErr := errors.New("connection reset")
+	transport := &failureInjectionTransport{attempts: []injectedAttempt{{err: transportErr}, {err: transportErr}}}
+	client := NewClient(
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithAttempts(2),
+		WithDelayFunc(func(int, error) time.Duration { return 0 }),
+	)
+	resp, err := client.Get("http://injected.test")
+	if resp != nil {
+		resp.Body.Close()
+	}
+	var retryErr *RetryError
+	if !errors.As(err, &retryErr) || !errors.Is(err, transportErr) {
+		t.Fatalf("error=%T %v, want RetryError unwrapping transport error", err, err)
+	}
+	if retryErr.StatusCode != 0 || retryErr.Attempts != 2 {
+		t.Fatalf("retry error = %+v", retryErr)
+	}
+	if (&RetryError{Attempts: 1}).Error() == "" {
+		t.Fatal("empty RetryError message")
+	}
+}
+
+func TestAttemptTimeout(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	client := NewClient(
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithAttempts(1),
+		WithAttemptTimeout(10*time.Millisecond),
+	)
+	resp, err := client.Get("http://attempt-timeout.test")
+	if resp != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("response=%v error=%v, want deadline exceeded", resp, err)
 	}
 }
 
@@ -1068,6 +1193,23 @@ func TestDoValidationAndRoundTripperErrors(t *testing.T) {
 	if _, err := (RoundTripper{}).RoundTrip(req); err == nil {
 		t.Fatal("nil round tripper client should fail")
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func FuzzRetryAfter(f *testing.F) {
+	f.Add("2")
+	f.Add("-1")
+	f.Add("not-a-delay")
+	f.Add(time.Now().Format(http.TimeFormat))
+	f.Fuzz(func(t *testing.T, value string) {
+		got := retryAfter(value, time.Now())
+		if got < 0 {
+			t.Fatalf("retryAfter(%q) = %s, want non-negative duration", value, got)
+		}
+	})
 }
 
 func TestOptionCoverage(t *testing.T) {

@@ -47,6 +47,8 @@
 // transports, elapsed-time limits, clocks, unsafe methods, and compatibility
 // hooks. [WithRetryMax] counts retries after the initial attempt, while
 // [WithAttempts] counts the initial attempt itself.
+// [WithAttemptTimeout] limits each individual HTTP attempt independently of
+// [WithMaxElapsedTime].
 //
 // [WithMaxElapsedTime] bounds the complete operation, including HTTP attempts
 // and backoff. Backoff is also checked against the request context deadline so
@@ -89,4 +91,6 @@
 // Client.Do returns is caller-managed and is not automatically retried.
 // Context cancellation and deadline expiry are normal control flow; httptry
 // does not emit built-in error-level logs for them.
+// A request must not be shared between concurrent [Client.Do] calls. Retry
+// preparation hooks receive and may mutate the original request.
 package httptry
